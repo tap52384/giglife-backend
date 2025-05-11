@@ -1,0 +1,3 @@
+# Firebase Admin SDK - https://firebase.google.com/docs/reference/admin/python
+# Installs firebase-admin and its dependencies
+firebase_functions~=0.1.0
