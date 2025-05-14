@@ -1,135 +1,94 @@
-# Welcome to Cloud Functions for Firebase for Python!
-# To get started, simply uncomment the below code or create your own.
-# Deploy with `firebase deploy`
-
+# functions/main.py
 from firebase_functions import https_fn
-from firebase_admin import auth, credentials, initialize_app, firestore
-from flask import Request
-import firebase_admin
+from firebase_admin import auth, initialize_app, firestore
+from utils import get_id_token, normalize_gmail, is_valid_email, is_valid_phone
 import json
 
-# initialize_app()
-# One-time init
-if not firebase_admin._apps:
-    cred = credentials.ApplicationDefault()
-    initialize_app(cred)
-
-# Provides shorthand access to the Firestore database
-# and Firebase Authentication.
+initialize_app()
 db = firestore.client()
 
-# ---------------------------
-# 🔐 Reusable Token Verifier
-# ---------------------------
-
-def verify_id_token_from_request(req: Request) -> dict:
-    """
-    Extracts and verifies the Firebase ID token from the Authorization header.
-
-    Returns a dict with:
-      - decoded_token: dict if verified, else None
-      - error: error message string or None
-      - http_status: HTTP status code (200 if valid, 401/403 if not)
-    """
-    auth_header = req.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return {
-            "decoded_token": None,
-            "error": "Missing or malformed Authorization header",
-            "http_status": 401
-        }
-
-    id_token = auth_header.split("Bearer ")[1]
-
+@https_fn.on_request()
+def register_user(request: https_fn.Request) -> https_fn.Response:
+    # Validate token and enforce 5-minute expiry for registration
     try:
-        decoded_token = auth.verify_id_token(id_token)
-        return {
-            "decoded_token": decoded_token,
-            "error": None,
-            "http_status": 200
-        }
-    except Exception as e:
-        return {
-            "decoded_token": None,
-            "error": f"Invalid token: {str(e)}",
-            "http_status": 401
-        }
-
-# --- Endpoint function definitions ---
-def on_request_example(req: https_fn.Request) -> https_fn.Response:
-    return https_fn.Response("Hello world!")
-
-# --- Routing table ---
-
-ROUTES = {
-    "/on_request_example": {
-        "handler": on_request_example,
-        "methods": ["GET", "POST"]
-    },
-    "/api/on_request_example": {
-        "handler": on_request_example,
-        "methods": ["GET", "POST"]
-    },
-}
-
-@https_fn.on_request()
-def api(req: https_fn.Request) -> https_fn.Response:
-    path = req.path # like "/api/on_request_example"
-    method = req.method # like "GET", "POST", etc.
-
-    handler = ROUTES.get(path)
-    if handler and method in handler.get("methods", []):
-        return handler.get("handler")(req)
-
-    return https_fn.Response(f"No route found for {path} with method {method}", status=404)
-
-# ---------------------------
-# 🔧 Register or Retrieve User
-# ---------------------------
-
-@https_fn.on_request()
-def register_user(req: Request) -> https_fn.Response:
-    """
-    Cloud Function to register or retrieve a user after Firebase Authentication.
-    - Verifies the Firebase ID token from the request
-    - Checks Firestore for an existing user document
-    - Creates a new document if the user is new
-    - Returns the user document as JSON
-    """
-
-    # 🔐 Step 1: Verify the token
-    auth_result = verify_id_token_from_request(req)
-    if auth_result["error"]:
+        decoded_token = get_id_token(request, max_age_minutes=5)
+    except ValueError as e:
         return https_fn.Response(
-            auth_result["error"],
-            status=auth_result["http_status"]
+            json.dumps({"error": str(e), "action": "signout_and_redirect"}),
+            status=401,
+            content_type="application/json"
         )
 
-    decoded_token = auth_result["decoded_token"]
-    uid = decoded_token["uid"]
-    phone = decoded_token.get("phone_number")
-    email = decoded_token.get("email")
+    uid = decoded_token.get("uid")
+    firebase_email = decoded_token.get("email")
+    firebase_phone = decoded_token.get("phone_number")
+    email_verified = decoded_token.get("email_verified", False)
 
-    # 🔍 Step 2: Look up the user in Firestore
-    user_ref = db.collection("users").document(uid)
-    user_doc = user_ref.get()
+    if not uid:
+        return https_fn.Response("Missing UID in token", status=400)
 
-    if not user_doc.exists:
-        # 🆕 Step 3: Create user if not found
-        user_data = {
-            "first_name": None,
-            "last_name": None,
-            "phone": phone,
-            "email": email,
-            "role": "trial",
-            "created_at": firestore.SERVER_TIMESTAMP
-        }
-        user_ref.set(user_data)
-        user_doc = user_ref.get()
+    users_ref = db.collection("users")
+    user_doc = users_ref.document(uid).get()
 
-    # ✅ Step 4: Return the user document
-    return https_fn.Response(
-        json.dumps(user_doc.to_dict()),
-        status=200,
-        mimetype="application/json"
-    )
+    # If user already exists, return it
+    if user_doc.exists:
+        return https_fn.Response(json.dumps(user_doc.to_dict()), status=200, content_type="application/json")
+
+    # Collect missing contact method from UI input
+    data = request.get_json(silent=True) or {}
+    input_email = data.get("email")
+    input_phone = data.get("phone")
+
+    # Determine login method and validate second method
+    if firebase_email:
+        if not is_valid_phone(input_phone):
+            return https_fn.Response(
+                json.dumps({
+                    "requires_additional_verification": True,
+                    "missing": ["phone"],
+                    "message": "Valid 10-digit phone number required."
+                }),
+                status=200,
+                content_type="application/json"
+            )
+        email_entered = firebase_email
+        email_validated = email_verified
+        phone_entered = input_phone
+        phone_validated = False
+
+    elif firebase_phone:
+        if not is_valid_email(input_email):
+            return https_fn.Response(
+                json.dumps({
+                    "requires_additional_verification": True,
+                    "missing": ["email"],
+                    "message": "Valid email address required."
+                }),
+                status=200,
+                content_type="application/json"
+            )
+        email_entered = input_email
+        email_validated = False
+        phone_entered = firebase_phone
+        phone_validated = True
+
+    else:
+        return https_fn.Response("Unable to determine login method.", status=400)
+
+    email_normalized = normalize_gmail(email_entered)
+
+    new_user = {
+        "uid": uid,
+        "email_entered": email_entered,
+        "email_normalized": email_normalized,
+        "email_validated": email_validated,
+        "phone": phone_entered,
+        "phone_validated": phone_validated,
+        "role": "trial",
+        "first_name": None,
+        "last_name": None
+    }
+
+    users_ref.document(uid).set(new_user)
+
+    return https_fn.Response(json.dumps(new_user), status=200, content_type="application/json")
